@@ -1,0 +1,20 @@
+# 构建产物
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.so
+
+# 打包产物与内网分发包（含样本影像，不公开）
+*.zip
+内网安装包/
+
+# 环境
+.venv/
+venv/
+.env
+
+# 编辑器
+.idea/
+.vscode/
