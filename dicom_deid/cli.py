@@ -312,7 +312,19 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _stabilize_output() -> None:
+    """非 TTY（重定向/管道）输出默认按系统 locale 编码，中文工具文本里的 emoji
+    （如 ⚠ U+26A0）在 GBK/cp1252 下无法编码 → 统一改 UTF-8 + 降级，绝不让编码问题崩掉 CLI。"""
+    for s in (sys.stdout, sys.stderr):
+        try:
+            if s is not None and not s.isatty():
+                s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _stabilize_output()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):

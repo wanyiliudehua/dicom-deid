@@ -16,7 +16,7 @@ from dicom_deid.audit import run as audit_run, AuditReport
 app = FastAPI(
     title="DICOM-DeID API",
     description="DICOM 医学影像脱敏工具 REST 接口",
-    version="1.0.0",
+    version="1.0.1",
 )
 
 
@@ -39,7 +39,7 @@ class VerifyRequest(BaseModel):
 # ── 健康检查 ──────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "1.0.1"}
 
 
 # ── 审计接口 ──────────────────────────────────────────
