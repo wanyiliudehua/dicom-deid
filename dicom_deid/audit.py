@@ -2,17 +2,21 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-import os
-import glob
-import re
 
 import pydicom
+
+from .uid_map import UID_RE, VENDOR_PREFIXES
 
 FALSE_POSITIVES = {
     "SmallestImagePixelValue", "LargestImagePixelValue",
     "SmallestPixelValueInSeries", "LargestPixelValueInSeries",
     "ImageType", "ImagePositionPatient", "ImageOrientationPatient",
     "NumberOfAverages", "ImagedNucleus", "SoftwareVersions", "ProtocolName",
+    # 脱敏标记自身（值 "YES"/方法名），不是 PHI 披露，别在复审里吓用户
+    "PatientIdentityRemoved", "DeidentificationMethod",
+    # 几何/体位/时序标识（被 "patient"/"identif" 关键词误命中），非身份信息
+    "DistanceSourceToPatient", "PatientOrientation",
+    "PatientPosition", "TemporalPositionIdentifier",
 }
 
 PHI_KEYWORDS = [
@@ -32,10 +36,6 @@ SIDECAR_EXTS = {
     ".xml", ".json", ".txt", ".csv", ".md", ".html", ".log",
     ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".pdf",
 }
-
-# UID 正则
-UID_RE = re.compile(rb'\d\.\d[\d.]{8,}')
-VENDOR_PREFIXES = (b"1.3.12.2.1107", b"1.2.276.0.7230010")
 
 
 @dataclass
@@ -66,6 +66,7 @@ class AuditReport:
     private_tags: set[str] = field(default_factory=set)
     private_vendor_uids: dict[str, int] = field(default_factory=dict)
     filename_leaks: list[tuple[str, str]] = field(default_factory=list)
+    dir_leaks: list[tuple[str, str]] = field(default_factory=list)
     consistency: Consistency = field(default_factory=Consistency)
 
 
@@ -76,7 +77,7 @@ def collect_dicom_files(directory: Path) -> list[Path]:
     无 128 字节前导（魔数嗅探失败时试探解析兜底）。像素数据不依赖解码。
     """
     out = []
-    for p in sorted(Path(directory).iterdir()):
+    for p in sorted(Path(directory).rglob("*")):
         if not p.is_file() or p.suffix.lower() in SIDECAR_EXTS:
             continue
         if _looks_like_dicom(p):
@@ -122,7 +123,7 @@ def run(directory: Path, on_progress=None, extra_needles=()) -> AuditReport:
                 rep.filename_leaks.append((fname, n))
 
         try:
-            ds = pydicom.dcmread(str(fp), force=True)
+            ds = pydicom.dcmread(str(fp), force=True, stop_before_pixels=True)
         except Exception as e:
             rep.parse_errors.append((fname, str(e)))
             continue
@@ -147,16 +148,18 @@ def run(directory: Path, on_progress=None, extra_needles=()) -> AuditReport:
                     data = b''
                 if data:
                     for uid in UID_RE.findall(data):
-                        if uid.startswith(VENDOR_PREFIXES[0]) or uid.startswith(VENDOR_PREFIXES[1]):
-                            rep.private_vendor_uids[uid.decode('ascii', errors='ignore')] = \
-                                rep.private_vendor_uids.get(uid.decode('ascii', errors='ignore'), 0) + 1
+                        if any(uid.startswith(p.encode()) for p in VENDOR_PREFIXES):
+                            key = uid.decode('ascii', errors='ignore')
+                            rep.private_vendor_uids[key] = rep.private_vendor_uids.get(key, 0) + 1
                 continue
 
             lkw = kw.lower()
             is_phi = any(k in lkw for k in PHI_KEYWORDS) and kw not in FALSE_POSITIVES
 
             try:
-                val_str = str(elem.value)
+                # 空值判空：零长度数值 VR（DS/IS 等）读回是 None，
+                # str(None)='None' 会被误当成"非空发现"——脱敏产物复审全靠这里准
+                val_str = "" if elem.value is None else str(elem.value)
             except Exception:
                 val_str = "<unreadable>"
             short = val_str[:80]
@@ -175,14 +178,28 @@ def run(directory: Path, on_progress=None, extra_needles=()) -> AuditReport:
                 if len(info.samples) < 5 and short not in info.samples:
                     info.samples.append(short)
 
-            # 一致性
-            match kw:
-                case "PatientID": pids.add(val_str)
-                case "PatientName": pnames.add(val_str)
-                case "AccessionNumber": accs.add(val_str)
-                case "StudyInstanceUID": studies.add(val_str)
-                case "SeriesInstanceUID": series.add(val_str)
-                case "SOPInstanceUID": sops.add(val_str)
+            # 一致性（空值不入表，避免 [''] 噪音）
+            if val_str:
+                match kw:
+                    case "PatientID": pids.add(val_str)
+                    case "PatientName": pnames.add(val_str)
+                    case "AccessionNumber": accs.add(val_str)
+                    case "StudyInstanceUID": studies.add(val_str)
+                    case "SeriesInstanceUID": series.add(val_str)
+                    case "SOPInstanceUID": sops.add(val_str)
+
+    # 目录名泄露：分目录导出的目录名常是检查号/患者ID/旧 UID——文件查了目录不查等于漏一半
+    idvals = {v for v in (pids | pnames | accs) if v}
+    for d in sorted(Path(directory).rglob("*")):
+        if not d.is_dir():
+            continue
+        rel = d.relative_to(directory).as_posix()
+        for n in fname_needles:
+            if n in rel:
+                rep.dir_leaks.append((rel, n))
+        for v in sorted(idvals):
+            if v in rel:
+                rep.dir_leaks.append((rel, f"身份值:{v}"))
 
     rep.consistency = Consistency(
         patient_ids=sorted(pids), patient_names=sorted(pnames),

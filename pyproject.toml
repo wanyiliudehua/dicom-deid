@@ -1,7 +1,8 @@
 [project]
 name = "dicom-deid"
-version = "1.0.1"
+version = "1.0.2"
 description = "DICOM 医学影像脱敏工具（交互式 TUI）"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "pydicom>=2.4",

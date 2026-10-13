@@ -1,10 +1,10 @@
 """DICOM-DeID FastAPI 接口"""
 from __future__ import annotations
-import os, tempfile
+import base64, tempfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -16,8 +16,17 @@ from dicom_deid.audit import run as audit_run, AuditReport
 app = FastAPI(
     title="DICOM-DeID API",
     description="DICOM 医学影像脱敏工具 REST 接口",
-    version="1.0.1",
+    version="1.0.2",
 )
+
+
+def _resolve_dir(s: str) -> Path:
+    """信任边界：服务端若配置了目录白名单（--root），只接受其下路径。"""
+    d = Path(s).resolve()
+    roots = getattr(app.state, "allowed_roots", None)
+    if roots and not any(d == r or d.is_relative_to(r) for r in roots):
+        raise HTTPException(400, f"路径不在允许目录内: {s}")
+    return d
 
 
 # ── 请求/响应模型 ──────────────────────────────────────
@@ -39,15 +48,15 @@ class VerifyRequest(BaseModel):
 # ── 健康检查 ──────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0.1"}
+    return {"status": "ok", "version": "1.0.2"}
 
 
 # ── 审计接口 ──────────────────────────────────────────
 @app.post("/audit")
 async def run_audit(req: AuditRequest):
     """只读扫描 DICOM 目录，输出 PHI 审计报告"""
-    d = Path(req.dir)
-    if not d.exists() or not d.is_dir():
+    d = _resolve_dir(req.dir)
+    if not d.is_dir():
         raise HTTPException(400, f"目录不存在: {req.dir}")
 
     def progress(i, total, name):
@@ -63,6 +72,7 @@ async def run_audit(req: AuditRequest):
         "person_names": len(rep.person_names),
         "private_vendor_uids": len(rep.private_vendor_uids),
         "filename_leaks": len(rep.filename_leaks),
+        "dir_leaks": len(rep.dir_leaks),
         "consistency": {
             "study_uids": rep.consistency.study_uids,
             "series_uids": rep.consistency.series_uids,
@@ -75,11 +85,11 @@ async def run_audit(req: AuditRequest):
 @app.post("/deid")
 async def run_deid(req: DeidRequest):
     """执行脱敏操作，输出到副本目录"""
-    src = Path(req.src_dir)
-    if not src.exists() or not src.is_dir():
+    src = _resolve_dir(req.src_dir)
+    if not src.is_dir():
         raise HTTPException(400, f"源目录不存在: {req.src_dir}")
 
-    out_dir = Path(req.out_dir) if req.out_dir else src.parent / "deid_output"
+    out_dir = _resolve_dir(req.out_dir) if req.out_dir else src.parent / "deid_output"
     try:
         profile = Profile.from_str(req.profile)
     except ValueError as e:
@@ -90,9 +100,12 @@ async def run_deid(req: DeidRequest):
     def progress(i, total, name):
         pass
 
-    summary: Summary = await _run_sync(
-        lambda: deid_run(src, out_dir, policy, on_progress=progress)
-    )
+    try:
+        summary: Summary = await _run_sync(
+            lambda: _deid_locked(src, out_dir, policy, on_progress=progress)
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     return {
         "src_files": summary.src_files,
@@ -110,8 +123,8 @@ async def run_deid(req: DeidRequest):
 @app.post("/verify")
 async def run_verify(req: VerifyRequest):
     """检查脱敏产物是否残留 PHI"""
-    d = Path(req.dir)
-    if not d.exists() or not d.is_dir():
+    d = _resolve_dir(req.dir)
+    if not d.is_dir():
         raise HTTPException(400, f"目录不存在: {req.dir}")
 
     def progress(i, total, name):
@@ -126,11 +139,6 @@ async def run_verify(req: VerifyRequest):
         "all_passed": result.all_passed,
         "filename_hits": len(result.filename_hits),
         "content_hits": dict(result.content_hits),
-        "pixel_ok": result.pixel_ok,
-        "pixel_bad": result.pixel_bad,
-        "study_uids": result.study_uids,
-        "series_uids": result.series_uids,
-        "sop_uids": result.sop_uids,
     }
 
 
@@ -138,38 +146,39 @@ async def run_verify(req: VerifyRequest):
 @app.post("/deid/upload")
 async def deid_upload(
     files: list[UploadFile] = File(...),
-    profile: str = "a",
-    rename_files: bool = True,
+    profile: str = Form("a"),
+    rename_files: bool = Form(True),
 ):
-    """上传 DICOM 文件并执行脱敏"""
-    # 创建临时目录
+    """上传 DICOM 文件并执行脱敏，返回脱敏文件（base64）"""
+    try:
+        p = Profile.from_str(profile)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_src = Path(tmp) / "src"
         tmp_out = Path(tmp) / "out"
         tmp_src.mkdir()
 
-        # 保存上传文件
-        for f in files:
+        # 保存上传文件（只取文件名末段，防路径穿越）
+        for i, f in enumerate(files):
+            name = Path(f.filename or f"upload_{i}").name
             content = await f.read()
-            (tmp_src / f.filename).write_bytes(content)
+            (tmp_src / name).write_bytes(content)
 
         # 脱敏
-        p = Profile.from_str(profile)
         policy = Policy(profile=p, rename_files=rename_files)
         summary = await _run_sync(lambda: deid_run(tmp_src, tmp_out, policy))
 
         # 读取结果
-        results = []
-        for fp in tmp_out.glob("*.dcm"):
-            data = fp.read_bytes()
-            results.append({
-                "filename": fp.name,
-                "size": len(data),
-                "data": data.hex(),  # 传输时用 hex，实际可用 base64
-            })
+        results = [{
+            "filename": fp.name,
+            "size": fp.stat().st_size,
+            "data": base64.b64encode(fp.read_bytes()).decode(),
+        } for fp in sorted(tmp_out.rglob("*.dcm"))]
 
     return {
-        "files": len(results),
+        "files": results,
         "summary": {
             "tags_cleared": summary.tags_cleared,
             "uids_remapped": summary.uids_remapped,
@@ -180,17 +189,25 @@ async def deid_upload(
 
 # ── 异步包装 ──────────────────────────────────────────
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 _executor = ThreadPoolExecutor(max_workers=4)
+_deid_lock = threading.Lock()  # 并发写同一输出目录会新旧产物混叠，脱敏整体串行化
+
+
+def _deid_locked(src, out, policy, on_progress=None):
+    with _deid_lock:
+        return deid_run(src, out, policy, on_progress=on_progress)
 
 
 async def _run_sync(fn):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_executor, fn)
 
 
 # ── 启动入口 ──────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # 默认仅本机：对外监听须走 dicom-deid serve --host ... --root ...（目录白名单）
+    uvicorn.run(app, host="127.0.0.1", port=8080)

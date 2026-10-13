@@ -4,6 +4,15 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+def _audit_flagged_keywords() -> set[str]:
+    """与审计同一判定规则（关键词命中且不在误报白名单）——
+    审计认定的 PHI 必须被脱敏清除，判定规则只维护 audit.py 一处。"""
+    from pydicom.datadict import keyword_dict
+    from .audit import PHI_KEYWORDS, FALSE_POSITIVES
+    return {kw for kw in keyword_dict
+            if any(k in kw.lower() for k in PHI_KEYWORDS) and kw not in FALSE_POSITIVES}
+
+
 class Profile(Enum):
     """A 保守：保留性别/年龄/身高体重/日期 | B 激进：全部清除"""
     Conservative = "a"
@@ -29,54 +38,55 @@ class Profile(Enum):
         return "Hermes Basic Profile B: all identifiers cleared, UID remap"
 
 
+# ---- 两档都清的标签 ----
+_BASE_CLEAR = [
+    # 患者标识
+    "PatientName", "PatientID", "PatientBirthDate",
+    "OtherPatientIDs", "OtherPatientNames", "PatientAddress",
+    "PatientTelephoneNumbers", "PatientBirthName", "PatientMotherBirthName",
+    # 检查/机构标识
+    "AccessionNumber", "StudyID", "InstitutionName", "InstitutionAddress",
+    "InstitutionalDepartmentName", "InstitutionCodeSequence",
+    "StationName", "DeviceSerialNumber", "StudyDescription",
+    # 人员姓名
+    "ReferringPhysicianName", "PerformingPhysicianName", "OperatorsName",
+    "PhysiciansOfRecord", "NameOfPhysiciansReadingStudy", "RequestingPhysician",
+    "ReferringPhysicianAddress", "ReferringPhysicianTelephoneNumbers",
+    # 流程标识
+    "PerformedProcedureStepID", "PerformedProcedureStepDescription",
+    "PerformedStationName", "ScheduledProcedureStepID",
+    "ScheduledPerformingPhysicianName", "ScheduledStationName",
+    "ScheduledProcedureStepDescription", "ScheduledProcedureStepLocation",
+    "RequestedProcedureID", "RequestedProcedureDescription",
+    "CommentsOnThePerformedProcedureStep",
+    "PlacerOrderNumberImagingServiceRequest",
+    "FillerOrderNumberImagingServiceRequest",
+    "AdmissionID", "CurrentPatientLocation", "RequestingService",
+    "OrderCallbackPhoneNumber", "PersonAddress", "PersonTelephoneNumbers",
+]
+
+# ---- B 激进额外清：临床身份属性 + 全部日期时间 ----
+_AGGRESSIVE_EXTRA = {
+    "PatientSex", "PatientAge", "PatientSize", "PatientWeight",
+    "StudyDate", "StudyTime", "SeriesDate", "SeriesTime",
+    "ContentDate", "ContentTime", "AcquisitionDate", "AcquisitionTime",
+    "AcquisitionDateTime", "InstanceCreationDate", "InstanceCreationTime",
+    "InstanceCreationDateTime",
+}
+
+
 @dataclass
 class Policy:
     profile: Profile
     rename_files: bool = True
-    jobs: int = 0  # 0 = 自动
-
-    # ---- 两档都清的标签 ----
-
-    def __post_init__(self):
-        if not hasattr(self, '_base_clear_initialized'):
-            self._base_clear_initialized = True
-            self._base_clear = [
-                # 患者标识
-                "PatientName", "PatientID", "PatientBirthDate",
-                "OtherPatientIDs", "OtherPatientNames", "PatientAddress",
-                "PatientTelephoneNumbers", "PatientBirthName", "PatientMotherBirthName",
-                # 检查/机构标识
-                "AccessionNumber", "StudyID", "InstitutionName", "InstitutionAddress",
-                "InstitutionalDepartmentName", "InstitutionCodeSequence",
-                "StationName", "DeviceSerialNumber", "StudyDescription",
-                # 人员姓名
-                "ReferringPhysicianName", "PerformingPhysicianName", "OperatorsName",
-                "PhysiciansOfRecord", "NameOfPhysiciansReadingStudy", "RequestingPhysician",
-                "ReferringPhysicianAddress", "ReferringPhysicianTelephoneNumbers",
-                # 流程标识
-                "PerformedProcedureStepID", "PerformedProcedureStepDescription",
-                "PerformedStationName", "ScheduledProcedureStepID",
-                "ScheduledPerformingPhysicianName", "ScheduledStationName",
-                "ScheduledProcedureStepDescription", "ScheduledProcedureStepLocation",
-                "RequestedProcedureID", "RequestedProcedureDescription",
-                "CommentsOnThePerformedProcedureStep",
-                "PlacerOrderNumberImagingServiceRequest",
-                "FillerOrderNumberImagingServiceRequest",
-                "AdmissionID", "CurrentPatientLocation", "RequestingService",
-                "OrderCallbackPhoneNumber", "PersonAddress", "PersonTelephoneNumbers",
-            ]
 
     def clear_keywords(self) -> set[str]:
-        ks = set(self._base_clear)
+        # 审计判定的 PHI 全部清除（含 ImageComments/AdditionalPatientHistory 等自由文本），
+        # 再按策略保留 kept_clinical——审计报警的字段绝不允许留在产物里
+        ks = set(_BASE_CLEAR) | _audit_flagged_keywords()
         if self.profile == Profile.Aggressive:
-            ks |= {
-                "PatientSex", "PatientAge", "PatientSize", "PatientWeight",
-                "StudyDate", "StudyTime", "SeriesDate", "SeriesTime",
-                "ContentDate", "ContentTime", "AcquisitionDate", "AcquisitionTime",
-                "AcquisitionDateTime", "InstanceCreationDate", "InstanceCreationTime",
-                "InstanceCreationDateTime",
-            }
-        return ks
+            ks |= _AGGRESSIVE_EXTRA
+        return ks - set(self.kept_clinical(self.profile))
 
     # ---- 需要长度保持重映射的 UID 标签 ----
     @staticmethod
@@ -88,15 +98,6 @@ class Policy:
             "ReferencedStudyInstanceUID", "ReferencedSeriesInstanceUID",
             "RelatedFrameOfReferenceUID", "ConcatenationUID",
             "SynchronizationFrameOfReferenceUID", "MediaStorageSOPInstanceUID",
-        }
-
-    @staticmethod
-    def uid_skip() -> set[str]:
-        return {
-            "SOPClassUID", "TransferSyntaxUID", "ReferencedSOPClassUID",
-            "MediaStorageSOPClassUID", "ImplementationClassUID",
-            "CodingSchemeUID", "ContextGroupExtensionCreatorUID",
-            "PrivateInformationCreatorUID",
         }
 
     @staticmethod

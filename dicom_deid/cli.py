@@ -47,17 +47,18 @@ def _audit_dict(rep) -> dict:
         "private_tags": sorted(rep.private_tags),
         "private_vendor_uids": rep.private_vendor_uids,
         "filename_leaks": [{"file": f, "needle": n} for f, n in rep.filename_leaks],
+        "dir_leaks": [{"dir": d, "needle": n} for d, n in rep.dir_leaks],
         "consistency": dataclasses.asdict(rep.consistency),
     }
 
 
-def _warn_skipped(src: Path, collected) -> None:
+def _warn_skipped(src: Path, collected) -> list[str]:
     """目录里有非 DICOM 文件被跳过时明确警告（如裸 .jp2 图像）——
     静默跳过会让用户以为'无法识别/没处理'，而这些文件的文件名可能就是泄露。"""
     from .audit import SIDECAR_EXTS
-    got = {p.name for p in collected}
-    skipped = [p.name for p in sorted(Path(src).iterdir())
-               if p.is_file() and p.name not in got
+    got = {p.resolve() for p in collected}
+    skipped = [p.relative_to(src).as_posix() for p in sorted(Path(src).rglob("*"))
+               if p.is_file() and p.resolve() not in got
                and p.suffix.lower() not in SIDECAR_EXTS]
     if skipped:
         print(f"⚠ 跳过 {len(skipped)} 个非 DICOM 文件 —— 本工具仅支持 DICOM 原图；"
@@ -97,6 +98,9 @@ def cmd_audit(args) -> int:
     print(f"  文件名泄露       : {len(rep.filename_leaks)}")
     for f, n in rep.filename_leaks[:5]:
         print(f"      {f}  命中 '{n}'")
+    print(f"  目录名泄露       : {len(rep.dir_leaks)}")
+    for d, n in rep.dir_leaks[:5]:
+        print(f"      {d}/  命中 '{n}'")
     c = rep.consistency
     print(f"  一致性           : PatientID={c.patient_ids} PatientName={c.patient_names}")
     print(f"                     Accession={c.accession_numbers} Study={c.study_uids} Series={c.series_uids} SOP={c.sop_uids}")
@@ -108,7 +112,7 @@ def cmd_audit(args) -> int:
         print(f"  报告已写入       : {args.json}")
 
     findings = bool(rep.phi_tags or rep.person_names or rep.filename_leaks
-                    or rep.private_vendor_uids or rep.parse_errors)
+                    or rep.dir_leaks or rep.private_vendor_uids or rep.parse_errors)
     if findings:
         print("结论：发现 PHI/泄露风险，脱敏前请先确认策略。")
         return EXIT_FINDINGS
@@ -134,6 +138,7 @@ def _print_plan(src: Path, out: Path, profile: Profile, rename: bool, dry_run: b
     print(f"  保留     : {'、'.join(kept)}")
     print("  UID      : 长度保持重映射（含嵌套 SQ、CSA 私有块等长替换）")
     print(f"  文件名   : {'按新 SOPInstanceUID 重命名' if rename else '保持原名（⚠ 仍可能泄露设备序列号）'}")
+    print("  目录结构 : 镜像源目录（旧 UID 命名的目录同步换成新 UID）")
     print("  标记     : PatientIdentityRemoved=YES + DeidentificationMethod")
 
 
@@ -151,12 +156,6 @@ def cmd_deid(args) -> int:
         profile = Profile.from_str(args.profile)
     except ValueError as e:
         print(f"错误：{e}", file=sys.stderr)
-        return EXIT_ERROR
-
-    existing = list(out.glob("*.dcm")) if out.is_dir() else []
-    if existing and not args.force:
-        print(f"错误：输出目录已含 {len(existing)} 个 .dcm，可能与新产物混叠。"
-              f"请换空目录或加 --force。", file=sys.stderr)
         return EXIT_ERROR
 
     rename = not args.keep_filename
@@ -178,8 +177,12 @@ def cmd_deid(args) -> int:
             return EXIT_ERROR
 
     policy = Policy(profile=profile, rename_files=rename)
-    s = deid.run(src, out, policy, on_progress=_progress(args.quiet),
-                 dry_run=args.dry_run)
+    try:
+        s = deid.run(src, out, policy, on_progress=_progress(args.quiet),
+                     dry_run=args.dry_run, force=args.force)
+    except ValueError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return EXIT_ERROR
     print(f"  源文件/出文件    : {s.src_files} / {s.out_files}")
     print(f"  清空标签         : {s.tags_cleared}")
     print(f"  UID 重映射       : {s.uids_remapped}（映射表 {s.uid_map_size} 条）")
@@ -222,8 +225,13 @@ def cmd_serve(args) -> int:
         print("   pip install \"dicom-deid[api]\"   # 即 fastapi/uvicorn/python-multipart",
               file=sys.stderr)
         return EXIT_ERROR
-    print(f"DICOM-DeID API: http://0.0.0.0:{args.port}")
-    uvicorn.run(app, host="0.0.0.0", port=args.port)
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.root:
+        print("错误：非本机监听必须用 --root 限定可访问目录，否则任意路径可被读写。",
+              file=sys.stderr)
+        return EXIT_ERROR
+    app.state.allowed_roots = [Path(r).resolve() for r in args.root] if args.root else None
+    print(f"DICOM-DeID API: http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port)
     return EXIT_OK
 
 
@@ -307,6 +315,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     ps = sub.add_parser("serve", help="启动 REST API 服务")
     ps.add_argument("--port", type=int, default=8080)
+    ps.add_argument("--host", default="127.0.0.1",
+                    help="监听地址（默认仅本机；对外监听时必须配 --root）")
+    ps.add_argument("--root", action="append", metavar="DIR",
+                    help="允许 API 访问的目录白名单（可多次）")
     ps.set_defaults(func=cmd_serve)
 
     return p

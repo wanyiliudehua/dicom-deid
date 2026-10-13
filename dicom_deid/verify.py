@@ -1,17 +1,14 @@
 """复验：确认脱敏产物无残留 PHI"""
 from __future__ import annotations
+import mmap
 from dataclasses import dataclass, field
 from pathlib import Path
-import os
-import glob
-import hashlib
 
-NEEDLES = [
-    b"Cheng", b"Yingping", b"1483304", b"19690402",
-    b"MR12609191481", b"MR20260919202615",
-    b"WanNan", b"YiJiShan", b"ZheShan", b"AWP57245", b"Department",
-    b"1.3.12.2.1107", b"1.2.276.0.7230010", b"57245",
-]
+from .audit import collect_dicom_files
+from .uid_map import VENDOR_PREFIXES
+
+# 通用特征串只留厂商 UID 前缀；具体患者/机构特征串由调用方经 extra_needles 传入
+NEEDLES = [p.encode() for p in VENDOR_PREFIXES]
 
 
 @dataclass
@@ -19,21 +16,10 @@ class VerifyResult:
     file_count: int = 0
     filename_hits: list[tuple[str, str]] = field(default_factory=list)
     content_hits: dict[str, int] = field(default_factory=dict)
-    pixel_ok: int = 0
-    pixel_bad: int = 0
-    pixel_missing: int = 0
-    study_uids: int = 0
-    series_uids: int = 0
-    sop_uids: int = 0
-    baseline_checked: int = 0
-    baseline_mismatch: list[str] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
 
     @property
     def all_passed(self) -> bool:
-        return (not self.filename_hits and not self.content_hits
-                and self.pixel_bad == 0 and self.pixel_missing == 0
-                and not self.baseline_mismatch)
+        return not self.filename_hits and not self.content_hits
 
 
 def run(directory: Path, on_progress=None, extra_needles=()) -> VerifyResult:
@@ -41,26 +27,31 @@ def run(directory: Path, on_progress=None, extra_needles=()) -> VerifyResult:
     needles = list(NEEDLES) + [
         n.encode('utf-8') if isinstance(n, str) else n for n in extra_needles
     ]
-    files = sorted(glob.glob(str(directory / "*.dcm")))
+    # 与审计同一套 DICOM 识别（不依赖 .dcm 扩展名），避免漏检后"假通过"
+    files = collect_dicom_files(directory)
     r.file_count = len(files)
 
     total = len(files)
     for idx, fp in enumerate(files, 1):
         if on_progress:
-            on_progress(idx, total, Path(fp).name)
-        fname = Path(fp).name
+            on_progress(idx, total, fp.name)
+        rel = fp.relative_to(directory).as_posix()
 
-        # A. 文件名扫描
+        # A. 路径扫描（文件名 + 目录名，目录名泄露同样致命）
         for nd in needles:
-            if nd in fname.encode('ascii', errors='ignore'):
-                r.filename_hits.append((fname, nd.decode()))
+            if nd in rel.encode('ascii', errors='ignore'):
+                r.filename_hits.append((rel, nd.decode()))
 
-        # B. 内容全字节扫描
-        with open(fp, 'rb') as f:
-            data = f.read()
-        for nd in needles:
-            cnt = data.count(nd)
-            if cnt:
-                r.content_hits[nd.decode()] = r.content_hits.get(nd.decode(), 0) + cnt
+        # B. 内容全字节扫描（mmap 惰性分页，大文件不占内存）
+        size = fp.stat().st_size
+        if size:
+            with open(fp, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                for nd in needles:
+                    cnt, pos = 0, 0
+                    while (i := mm.find(nd, pos)) != -1:
+                        cnt += 1
+                        pos = i + len(nd)
+                    if cnt:
+                        r.content_hits[nd.decode()] = r.content_hits.get(nd.decode(), 0) + cnt
 
     return r

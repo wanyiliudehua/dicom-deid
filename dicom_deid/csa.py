@@ -1,15 +1,8 @@
 """Siemens CSA 私有块内 UID 等长替换"""
 from __future__ import annotations
-import re
 from dataclasses import dataclass, field
 
-from .uid_map import UidMap
-
-UID_RE = re.compile(rb'\d\.\d[\d.]{8,}')
-
-CSA_TAGS = [(0x0029, 0x1010), (0x0029, 0x1020)]
-
-VENDOR_PREFIXES = ("1.3.12.2.1107", "1.2.276.0.7230010", "1.2.840.113619", "1.3.46.670589")
+from .uid_map import UidMap, UID_RE, VENDOR_PREFIXES
 
 
 @dataclass

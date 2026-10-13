@@ -30,7 +30,7 @@ MODES = ["① 审计 (Audit)", "② 脱敏 (Deid)", "③ 复验 (Verify)"]
 MODE_HELP = {
     "① 审计 (Audit)": "扫描 PHI 字段、私有块内 UID、文件名泄露",
     "② 脱敏 (Deid)": "生成脱敏副本（原目录只读）",
-    "③ 复验 (Verify)": "检查脱敏产物是否残留 PHI、像素是否完整",
+    "③ 复验 (Verify)": "检查脱敏产物是否残留 PHI",
 }
 
 
@@ -55,7 +55,7 @@ class DicomDeidApp(App):
         Binding("3", "set_mode(2)", "复验"),
         Binding("a", "set_profile('a')", "A保守"),
         Binding("b", "set_profile('b')", "B激进"),
-        Binding("enter", "run_action", "执行"),
+        Binding("enter", "run_action", "执行", priority=True),  # priority：焦点在输入框时 Enter 也要能执行
         Binding("escape", "quit", "退出"),
     ]
 
@@ -114,7 +114,8 @@ class DicomDeidApp(App):
             self.profile = "b"
             self.notify("策略: B 激进", severity="warning")
         elif id_ == "run_btn":
-            self.run_action()
+            # 不能写 self.run_action()：那是 Textual 内置 App.run_action(action)
+            self.action_run_action()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "dir_input":
@@ -133,10 +134,7 @@ class DicomDeidApp(App):
         self.result = None
         log = self.query_one("#log")
         table = self.query_one("#result_table")
-        table.clear_columns()
-
-        def progress(msg: str):
-            log.write(msg)
+        table.clear(columns=True)
 
         def run_in_thread():
             try:
@@ -184,7 +182,7 @@ class DicomDeidApp(App):
 
     def _show_audit(self, rep: AuditReport) -> None:
         table = self.query_one("#result_table")
-        table.clear_columns()
+        table.clear(columns=True)
         table.add_column("项目", width=28)
         table.add_column("值", width=30)
         table.add_row("目录", rep.dir)
@@ -194,13 +192,14 @@ class DicomDeidApp(App):
         table.add_row("人名字段", str(len(rep.person_names)))
         table.add_row("私有块 UID", str(len(rep.private_vendor_uids)))
         table.add_row("文件名泄露", str(len(rep.filename_leaks)))
+        table.add_row("目录名泄露", str(len(rep.dir_leaks)))
         table.add_row("Study UID", str(rep.consistency.study_uids))
         table.add_row("Series UID", str(rep.consistency.series_uids))
         table.add_row("SOP UID", str(rep.consistency.sop_uids))
 
     def _show_deid(self, s: DeidSummary) -> None:
         table = self.query_one("#result_table")
-        table.clear_columns()
+        table.clear(columns=True)
         table.add_column("项目", width=28)
         table.add_column("值", width=30)
         table.add_row("源文件", str(s.src_files))
@@ -213,6 +212,7 @@ class DicomDeidApp(App):
 
     def _show_verify(self, v: VerifyResult) -> None:
         table = self.query_one("#result_table")
+        table.clear(columns=True)
         table.add_column("项目", width=28)
         table.add_column("值", width=30)
         table.add_row("文件数", str(v.file_count))

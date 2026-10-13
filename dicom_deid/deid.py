@@ -14,20 +14,8 @@ from .policy import Policy, Profile
 from .uid_map import UidMap
 from .csa import process_blob
 
-UID_RE = re.compile(rb'\d\.\d[\d.]{8,}')
-
-# 厂商 UID 前缀
-VENDOR_PREFIXES = ("1.3.12.2.1107", "1.2.276.0.7230010")
-
 # CSA 私有块标签
 CSA_TAGS = [(0x0029, 0x1010), (0x0029, 0x1020)]
-
-# XML 脱敏标签
-XML_CLEAR_TAGS = {
-    '00080050', '00080080', '00080081', '00080090', '00081010', '00081030',
-    '00081040', '00081050', '00100010', '00100020', '00100030', '00181000',
-    '00200010', '00400253', '00400009', '00400280',
-}
 
 
 @dataclass
@@ -40,7 +28,6 @@ class Summary:
     renamed_files: int = 0
     uid_map_size: int = 0
     errors: list[tuple[str, str]] = field(default_factory=list)
-    pixel_identical: int = 0
 
 
 def _walk_clear(ds: pydicom.Dataset, clear_kws: set[str], log: list[dict]) -> int:
@@ -86,9 +73,13 @@ def _walk_clear(ds: pydicom.Dataset, clear_kws: set[str], log: list[dict]) -> in
 
 
 def _remap_uids(ds: pydicom.Dataset, uid_kws: set[str], uid_map: UidMap) -> int:
-    """UID 长度保持重映射"""
+    """UID 长度保持重映射（含嵌套 Sequence）"""
     n = 0
     for elem in ds:
+        if elem.VR == "SQ":
+            for item in elem.value or []:
+                n += _remap_uids(item, uid_kws, uid_map)
+            continue
         kw = elem.keyword or ""
         if kw in uid_kws:
             old = str(elem.value)
@@ -104,7 +95,6 @@ def _remap_uids(ds: pydicom.Dataset, uid_kws: set[str], uid_map: UidMap) -> int:
 
 def _fix_csa(ds: pydicom.Dataset, uid_map: UidMap) -> tuple[int, list[str]]:
     """CSA 私有块内厂商 UID 等长替换"""
-    from .csa import process_blob as _process_blob
     from pydicom.tag import Tag
     total = 0
     errors = []
@@ -113,37 +103,37 @@ def _fix_csa(ds: pydicom.Dataset, uid_map: UidMap) -> tuple[int, list[str]]:
         if tag not in ds:
             continue
         blob = bytes(ds[tag].value)
-        new_blob, res = _process_blob(blob, uid_map)
-        total += res.replaced
+        new_blob, res = process_blob(blob, uid_map)
         if not res.length_preserved:
             errors.append(f"CSA ({g:04X},{e:04X}) 长度变化，已回滚")
             continue
+        total += res.replaced
         for u in res.unmapped:
             errors.append(f"CSA 内 UID 无法映射: {u}")
         ds[tag].value = new_blob
     return total, errors
 
 
-def _set_str(ds: pydicom.Dataset, keyword: str, value: str):
-    """设置字符串标签（仅在已存在时更新）"""
-    try:
-        ds[keyword].value = value
-    except KeyError:
-        pass
-
-
 def run(src: Path, out: Path, policy: Policy,
         on_progress: Callable[[int, int, str], None] | None = None,
-        dry_run: bool = False) -> Summary:
+        dry_run: bool = False, force: bool = False) -> Summary:
     """执行脱敏。dry_run=True 时走完全流程但不写任何文件。"""
     if not dry_run:
         os.makedirs(out, exist_ok=True)
+        existing = list(out.rglob("*.dcm"))
+        if existing and not force:
+            raise ValueError(f"输出目录已含 {len(existing)} 个 .dcm，可能与新产物混叠；请换空目录或允许覆盖(force)")
 
     from .audit import collect_dicom_files
-    files = collect_dicom_files(src)
+    # 输出目录若嵌套在源目录内，排除其中文件，避免把自己的产物当输入（尤其 --force 重跑时）
+    out_res = out.resolve()
+    files = [f for f in collect_dicom_files(src)
+             if not f.resolve().is_relative_to(out_res)]
 
     summary = Summary(src_files=len(files))
     uid_map = UidMap()
+    clear_kws = policy.clear_keywords()  # 提出循环：全量 DICOM 词典扫描只做一次
+    written: set[str] = set()
 
     total = len(files)
     for idx, fp in enumerate(files, 1):
@@ -155,7 +145,6 @@ def run(src: Path, out: Path, policy: Policy,
             log = []
 
             # 清空 PHI
-            clear_kws = policy.clear_keywords()
             n_clear = _walk_clear(ds, clear_kws, log)
             summary.tags_cleared += n_clear
 
@@ -169,21 +158,31 @@ def run(src: Path, out: Path, policy: Policy,
             summary.csa_uids_replaced += csa_n
             summary.errors.extend([(Path(fp).name, e) for e in csa_errs])
 
-            # 审计标记
-            _set_str(ds, "PatientIdentityRemoved", "YES")
-            _set_str(ds, "DeidentificationMethod", policy.profile.method_text)
+            # 审计标记（无条件写入，下游靠它识别已脱敏）
+            ds.PatientIdentityRemoved = "YES"
+            ds.DeidentificationMethod = policy.profile.method_text
 
-            # 输出
+            # 输出：镜像源目录结构；目录名若是已知旧 UID（按检查号/StudyUID 分目录的导出），
+            # 同步换成新 UID，否则目录名会把原 UID 泄露出去
+            rel = Path(fp).relative_to(src)
+            rel_dir = Path(*(uid_map.get(p) or p for p in rel.parent.parts))
             if policy.rename_files:
-                out_name = f"{ds.SOPInstanceUID}.dcm"
+                name = f"{ds.SOPInstanceUID}.dcm"
             else:
-                out_name = Path(fp).name
-            out_path = out / out_name
+                name = rel.name  # --keep-filename：保持原名（⚠ 文件名可能泄露）
+            out_rel = rel_dir / name
+            key = out_rel.as_posix()
+            if key in written:
+                summary.errors.append((str(rel), f"输出名冲突: {key}（重复 SOPInstanceUID），已跳过"))
+                continue
+            written.add(key)
+            out_path = out / out_rel
             if not dry_run:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
                 ds.save_as(str(out_path), write_like_original=False)
             summary.out_files += 1
 
-            if policy.rename_files and out_name != Path(fp).name:
+            if policy.rename_files and name != rel.name:
                 summary.renamed_files += 1
 
         except Exception as e:
@@ -197,23 +196,32 @@ def run(src: Path, out: Path, policy: Policy,
     with open(uid_map_path, 'w', encoding='utf-8') as fh:
         json.dump(uid_map.mapping, fh, ensure_ascii=False, indent=2)
 
-    # XML 处理
-    xml_files = sorted(glob.glob(str(src / "*.xml")))
-    if xml_files:
-        with open(xml_files[0], 'r', encoding='utf-8-sig') as fh:
+    # XML 侧车：全部处理；UID 按词边界整体替换，防止短 UID 截坏长 UID
+    # 只匹配叶子属性（内容不含 <Attribute），否则父级 SQ 的匹配会把第一个子属性整个吞掉
+    pat = re.compile(r'<Attribute Tag="([0-9A-Fa-f]{8})" VR="([A-Z]{2})">((?:(?!<Attribute)[\s\S])*?)</Attribute>')
+    from pydicom.datadict import dictionary_keyword
+    def repl(m):
+        # 与 DICOM 同一套清空规则（标签号→关键词），性别/年龄/体重/日期/姓名随策略清
+        if dictionary_keyword(int(m.group(1), 16)) in clear_kws:
+            return f'<Attribute Tag="{m.group(1)}" VR="{m.group(2)}"></Attribute>'
+        return m.group(0)
+    xml_files = [xf for xf in
+                 sorted(glob.glob(str(src / "**" / "*.xml"), recursive=True))
+                 if not Path(xf).resolve().is_relative_to(out_res)]
+    for i, xf in enumerate(xml_files, 1):
+        with open(xf, 'r', encoding='utf-8-sig') as fh:
             raw = fh.read()
-        for old, new in uid_map.mapping.items():
-            if old in raw:
-                raw = raw.replace(old, new)
-        pat = re.compile(r'<Attribute Tag="([0-9A-Fa-f]{8})" VR="([A-Z]{2})">(.*?)</Attribute>', re.S)
-        def repl(m):
-            if m.group(1).upper() in XML_CLEAR_TAGS:
-                return f'<Attribute Tag="{m.group(1)}" VR="{m.group(2)}"></Attribute>'
-            return m.group(0)
+        mapping = uid_map.mapping
+        if mapping:
+            uid_pat = re.compile(r'\b(?:' + '|'.join(sorted(map(re.escape, mapping), key=len, reverse=True)) + r')\b')
+            raw = uid_pat.sub(lambda m: mapping[m.group(0)], raw)
         raw = pat.sub(repl, raw)
-        study_new = uid_map.get("1.2.276.0.7230010.3.1.2.2843334150.21124.1789818734.943") or "study"
-        xml_out = out / f"{study_new}.xml"
-        with open(xml_out, 'w', encoding='utf-8') as fh:
+        # 侧车输出同样镜像目录结构（deid_N.xml 命名，原文件名可能是 UID）
+        xrel = Path(xf).relative_to(src)
+        xdir = Path(*(uid_map.get(p) or p for p in xrel.parent.parts))
+        out_x = out / xdir / f"deid_{i}.xml"
+        out_x.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_x, 'w', encoding='utf-8') as fh:
             fh.write(raw)
 
     return summary

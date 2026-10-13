@@ -6,7 +6,7 @@
 > sharing — with dual de-identification policies, length-preserving UID pseudonymization
 > and Siemens CSA private-tag handling.
 
-**v1.0.1 · Python ≥ 3.11 · Windows / macOS / Linux**
+**v1.0.2 · Python ≥ 3.11 · Windows / macOS / Linux**
 
 ---
 
@@ -21,7 +21,7 @@ This tool scans first, de-identifies second — so nothing walks out unnoticed.
 
 | Feature | Description |
 |---|---|
-| **Audit** | Read-only scan: PHI tags, vendor UIDs in private blocks, file-name leaks, cross-file consistency |
+| **Audit** | Read-only scan: PHI tags, vendor UIDs in private blocks, file/directory-name leaks, cross-file consistency |
 | **De-identify** | Produce a de-identified copy (source stays read-only), dual policies, length-preserving UID remapping |
 
 ### Two de-identification policies
@@ -40,8 +40,10 @@ This tool scans first, de-identifies second — so nothing walks out unnoticed.
   (magic-number sniffing + trial parsing fallback)
 - 🗜 **Lossless compressed DICOM supported out of the box**: RLE / JPEG2000 / JPEG-LS —
   pixel bytes pass through untouched, no codec plugins required
-- 🔢 **Length-preserving UID remapping**: fixed root `1.2.826.0.1.3680043.10.9999.` + SHA256-derived digits;
-  SOPClassUID / TransferSyntaxUID are never modified; `uid_map.json` is written for traceability
+- 🔢 **Length-preserving UID remapping**: fixed root `1.2.826.0.1.3680043.10.9999.` + SHA256-derived digits
+  (per-run random salt: two runs never produce the same pseudonyms and the scheme cannot be
+  reversed by recomputation; the mapping is kept in `uid_map.json` for traceability);
+  SOPClassUID / TransferSyntaxUID are never modified
 - 🚢 **Siemens CSA private blocks**: substring scan & replacement in `(0029,1010)/(0029,1020)`,
   length unchanged so binary structure stays intact
 - 🛡 **Safety guardrails**: source directory is read-only; output dir = source dir is rejected;
@@ -119,11 +121,16 @@ print(summary.out_files, summary.tags_cleared)
 
 ## Output layout
 
+The output **mirrors the source directory tree**; directory names that are old UIDs
+(e.g. studies exported into StudyUID folders) are remapped to the new UIDs.
+
 ```
 deid_output/
-├── <new-SOPInstanceUID>.dcm   # de-identified, renamed file
 ├── uid_map.json               # old UID → new UID mapping (for audit trail)
-└── <new-StudyInstanceUID>.xml # de-identified sidecar file (if any)
+├── <new-SOPInstanceUID>.dcm   # de-identified, renamed file from the source root
+└── <new-StudyInstanceUID>/    # mirrored subdirectory (old-UID dir names remapped)
+    ├── <new-SOPInstanceUID>.dcm
+    └── deid_N.xml             # de-identified sidecar file (if any)
 ```
 
 ## Scope
@@ -151,3 +158,7 @@ dicom_deid/
    (use `--force`), to avoid mixing old and new files.
 3. Re-auditing de-identified output should report **no PHI found** / exit code 0 —
    that self-check is the recommended final step.
+
+## License
+
+[MIT](LICENSE)

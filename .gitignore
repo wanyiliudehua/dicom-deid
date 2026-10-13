@@ -9,6 +9,8 @@ __pycache__/
 # 打包产物与内网分发包（含样本影像，不公开）
 *.zip
 内网安装包/
+intranet-kit-en/
+使用说明书.md
 
 # 环境
 .venv/
